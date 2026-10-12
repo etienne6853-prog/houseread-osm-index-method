@@ -1,0 +1,82 @@
+{
+ "attribution": {
+  "text": "© OpenStreetMap contributors",
+  "url": "https://www.openstreetmap.org/copyright"
+ },
+ "build": {
+  "command": "python3 osm_index_method_build.py us50_dc_2026.osm.pbf OUTPUT_DIR 4be22b3612b16e7a903020709760db6581ef27175cbe2c4e99e38f6b0724d8df",
+  "requires": "Python 3 (standard library) and osmium (osmium version 1.19.1)",
+  "script": "osm_index_method_build.py"
+ },
+ "derivative_database": {
+  "content": "OpenStreetMap objects tagged addr:housenumber, with their geometry; two key columns computed by the normalization rules below; no other data",
+  "format": "SQLite",
+  "index_key": "(num, rue)",
+  "name": "osm_num_rue v1 (2026-10-09)",
+  "table": "osm(num, rue, oid, ligne, geom, complet)"
+ },
+ "equivalent_openstreetmap_data": {
+  "how": "the planet file named above, or any OpenStreetMap extract of the same date covering the 50 U.S. states and the District of Columbia",
+  "url": "https://planet.openstreetmap.org/"
+ },
+ "files": [
+  {
+   "bytes": 8466,
+   "content": "#!/usr/bin/env python3\n# osm_index_method_build.py -- build script of the OpenStreetMap-derived address index \"osm_num_rue v1 (2026-10-09)\",\n# published as part of the ODbL 4.6(b) method (lot OSM-CONFORMITE-TEST, 12/10). Standalone: Python 3 stdlib + osmium.\n# It imports ONLY osm_normalization.py, the normalization rules shipped next to it in the same method file.\n#\n# What it does to the OpenStreetMap extract (the whole list of alterations):\n#   1. keeps the OSM objects (nodes, ways, relations) tagged addr:housenumber   (osmium tags-filter)\n#   2. attaches node coordinates to those ways (osmium add-locations-to-ways) and the member geometry of those\n#      relations (osmium getid -r)\n#   3. stores them in one SQLite table osm(num, rue, oid, ligne, geom, complet), where\n#        num   = normalized addr:housenumber            (osm_normalization.norm)\n#        rue   = normalized addr:street                 (osm_normalization.norm_street, through osm_returned)\n#        oid   = OSM object id (n123 / w123 / r123), ligne = the object in OPL form, geom = its geometry in OPL,\n#        complet = 1 if every node of the geometry was found in the extract\n#   4. creates the index cle_num_rue on (num, rue).\n# No other data is read: no address list, no third-party database. No row is dropped (an empty rue is a value).\n#\n# Usage: osm_index_method_build.py EXTRACT.osm.pbf OUTPUT_DIR [EXPECTED_SHA256]\n# Row logic below is the one used to build the index on 2026-10-09; only machine-specific paths and an internal\n# fingerprint step were left out.\nimport hashlib\nimport json\nimport os\nimport sqlite3\nimport subprocess\nimport sys\nimport time\n\nimport osm_normalization as P\n\nNAME = \"osm_num_rue.sqlite\"\nBUILD_RULE_VERSION = \"osm_num_rue v1 (2026-10-09)\"\nUSAGE = \"usage public sous ODbL, methode offerte (4.6 b)\"\nATTRIBUTION = \"© OpenStreetMap contributors — ODbL 1.0\"\nLICENCE_URL = \"https://www.openstreetmap.org/copyright\"\n\n\ndef osm_cle(line):\n    # access key of the address matcher: normalized addr:housenumber read in the OPL line\n    i = line.find(\"addr:housenumber=\")\n    j, k = line.find(\",\", i), line.find(\" \", i)\n    k = k if k > 0 else len(line.rstrip(\"\\n\"))\n    return P.norm(P.opl_unesc(line[i + 17: j if 0 < j < k else k]))\n\n\ndef osm_rue(line):\n    # normalized street: opl_parse then osm_returned\n    return P.osm_returned(P.opl_parse(line)[2])[\"street\"]\n\n\ndef way_geometry(addr_line, located_line, counts):\n    \"\"\"(geometry OPL, complet) of a way from its line with node locations (osmium add-locations-to-ways).\"\"\"\n    a, b = addr_line[:addr_line.find(\" \")], located_line[:located_line.find(\" \")]\n    if a != b:\n        raise SystemExit(\"STOP: ways out of step\")\n    i = located_line.find(\" N\")\n    refs = located_line[i + 2:].split(\" \")[0].rstrip(\"\\n\").split(\",\") if i > 0 else []\n    g, missing = [], False\n    for r in refs:\n        if not r:\n            continue\n        xi, yi = r.find(\"x\"), r.find(\"y\")\n        counts[\"refs_w\"] += 1\n        nid, x, y = r[1:xi], r[xi + 1:yi], r[yi + 1:]\n        if not x or not y:\n            counts[\"refs_w_sans_coord\"] += 1\n            missing = True\n            continue\n        g.append(\"n%s x%s y%s\\n\" % (nid, x, y))\n    counts[\"chemins_incomplets\"] += missing\n    return \"\".join(g), 0 if missing else 1\n\n\ndef rows(addr_lines, located_ways, counts, relations):\n    \"\"\"One row per object carrying addr:housenumber, in stream order. Relations get their geometry later.\"\"\"\n    for line in addr_lines:\n        t_ = line[0]\n        counts[t_] += 1\n        oid = line[:line.find(\" \")]\n        rue = osm_rue(line)\n        counts[\"rue_vide\"] += rue == \"\"\n        if t_ == \"w\":\n            yield (osm_cle(line), rue, oid, line) + way_geometry(line, next(located_ways), counts)\n        else:\n            if t_ == \"r\":\n                relations.append(oid)\n            yield osm_cle(line), rue, oid, line, None, 1 if t_ == \"n\" else None\n\n\ndef relation_complete(rid, rels_lines, nodes, ways, seen):\n    if rid in seen:\n        return True\n    seen.add(rid)\n    rl = rels_lines.get(rid)\n    if rl is None:\n        return False\n    for m, x in P.opl_parse(rl)[6]:\n        if m == \"n\" and x not in nodes:\n            return False\n        if m == \"w\" and (x not in ways or any(n not in nodes for n in P.opl_parse(ways[x])[5])):\n            return False\n        if m == \"r\" and not relation_complete(x, rels_lines, nodes, ways, seen):\n            return False\n    return True\n\n\ndef main(pbf, out, expected_sha=None):\n    sha = hashlib.sha256()\n    with open(pbf, \"rb\") as f:\n        for b in iter(lambda: f.read(1 << 24), b\"\"):\n            sha.update(b)\n    if expected_sha and sha.hexdigest() != expected_sha:\n        raise SystemExit(\"STOP: extract sha256 %s != expected %s\" % (sha.hexdigest(), expected_sha))\n    path = os.path.join(out, NAME)\n    if os.path.exists(path):\n        raise SystemExit(\"STOP: %s already exists (never overwritten)\" % path)\n    os.makedirs(os.path.join(out, \"tmp-tri\"), exist_ok=True)\n    db = sqlite3.connect(path)\n    for p in (\"journal_mode=OFF\", \"synchronous=OFF\", \"temp_store=FILE\", \"cache_size=-2000000\", \"page_size=4096\"):\n        db.execute(\"pragma \" + p)\n    db.execute(\"create table osm(num text, rue text, oid text, ligne text, geom text, complet integer)\")\n    loc_cmd = \"osmium tags-filter '%s' w/addr:housenumber -f pbf -o - | osmium add-locations-to-ways -F pbf - \" \\\n              \"--ignore-missing-nodes -f opl,add_metadata=false -o -\" % pbf\n    loc = subprocess.Popen([\"/bin/sh\", \"-c\", loc_cmd], stdout=subprocess.PIPE, text=True, bufsize=1 << 20)\n    located = (l for l in loc.stdout if l[0] == \"w\")\n    counts = {\"n\": 0, \"w\": 0, \"r\": 0, \"refs_w\": 0, \"refs_w_sans_coord\": 0, \"chemins_incomplets\": 0,\n              \"relations_incompletes\": 0, \"rue_vide\": 0}\n    rel = []\n    db.executemany(\"insert into osm values (?,?,?,?,?,?)\", rows(P.osm_addr_lines(pbf), located, counts, rel))\n    db.commit()\n    if sum(1 for _ in located):\n        raise SystemExit(\"STOP: located ways without counterpart\")\n    counts[\"rc_localisation\"] = loc.wait()          # recorded, as in the 2026-10-09 build (rc 0 there)\n\n    idf = os.path.join(out, \"tmp-tri\", \"relations_ids.txt\")\n    open(idf, \"w\").write(\"\\n\".join(rel) + \"\\n\")\n    p = subprocess.Popen([\"osmium\", \"getid\", \"-r\", \"-i\", idf, \"-f\", \"opl,add_metadata=false\", \"-o\", \"-\", pbf],\n                         stdout=subprocess.PIPE, text=True, bufsize=1 << 20)\n    nodes, ways, rels_lines = {}, {}, {}\n    for l in p.stdout:\n        oid = int(l[1:l.find(\" \")])\n        (nodes if l[0] == \"n\" else ways if l[0] == \"w\" else rels_lines)[oid] = l\n    counts[\"rc_getid_relations\"] = p.wait()        # recorded (osmium returns 1 when a member is missing)\n    os.remove(idf)\n    up = []\n    for r in rel:\n        rl = rels_lines.get(int(r[1:]))\n        mem = P.opl_parse(rl)[6] if rl else []\n        wl = [ways[w] for m, w in mem if m == \"w\" and w in ways]\n        ns = dict.fromkeys(n for w in wl for n in P.opl_parse(w)[5])\n        ok = relation_complete(int(r[1:]), rels_lines, nodes, ways, set())\n        counts[\"relations_incompletes\"] += not ok\n        up.append((\"\".join(wl) + \"\".join(nodes[n] for n in ns if n in nodes), 1 if ok else 0))\n    fin = db.execute(\"select rowid, oid from osm where rowid > (select max(rowid) from osm) - ? order by rowid\",\n                     (len(rel),)).fetchall()\n    if [o for _, o in fin] != rel:\n        raise SystemExit(\"STOP: relations not at the end of the stream\")\n    db.executemany(\"update osm set geom = ?, complet = ? where rowid = ?\",\n                   [(g, ok, rid) for (g, ok), (rid, _) in zip(up, fin)])\n    db.commit()\n    db.execute(\"create index cle_num_rue on osm(num, rue)\")\n    meta = {\"statut\": \"OSM_ODBL_DERIVED\", \"usage_autorise\": USAGE, \"attribution\": ATTRIBUTION,\n            \"licence_url\": LICENCE_URL, \"osm_source_file\": os.path.basename(pbf), \"osm_source_sha256\": sha.hexdigest(),\n            \"build_rule_version\": BUILD_RULE_VERSION, \"index_key\": \"(num, rue)\",\n            \"created_at\": time.strftime(\"%Y-%m-%dT%H:%M:%SZ\", time.gmtime())}\n    db.execute(\"create table metadonnees(cle text primary key, valeur text)\")\n    db.executemany(\"insert into metadonnees values (?,?)\", sorted(meta.items()))\n    db.commit()\n    db.close()\n    print(json.dumps(counts, sort_keys=True))\n\n\nif __name__ == \"__main__\":\n    if len(sys.argv) not in (3, 4):\n        raise SystemExit(\"usage: osm_index_method_build.py EXTRACT.osm.pbf OUTPUT_DIR [EXPECTED_SHA256]\")\n    main(*sys.argv[1:])\n",
+   "name": "osm_index_method_build.py",
+   "role": "build script (run it next to osm_normalization.py)",
+   "sha256": "6b376528e4e6692be341421a20ae9a10ff810ea5027cd0293b927899158f660f"
+  },
+  {
+   "bytes": 2695,
+   "content": "# osm_normalization.py -- address normalization rules and OPL reading used to build the OpenStreetMap-\n# derived index osm_num_rue v1 (ODbL 4.6(b) method). Extracted verbatim from the code that reads the index.\nimport re\nimport subprocess\n\n\nABR = {\"STREET\": \"ST\", \"AVENUE\": \"AVE\", \"AV\": \"AVE\", \"DRIVE\": \"DR\", \"ROAD\": \"RD\", \"BOULEVARD\": \"BLVD\",\n       \"LANE\": \"LN\", \"COURT\": \"CT\", \"PLACE\": \"PL\", \"TERRACE\": \"TER\", \"CIRCLE\": \"CIR\", \"PARKWAY\": \"PKWY\",\n       \"HIGHWAY\": \"HWY\", \"TRAIL\": \"TRL\", \"SQUARE\": \"SQ\", \"EXPRESSWAY\": \"EXPY\", \"FREEWAY\": \"FWY\",\n       \"NORTH\": \"N\", \"SOUTH\": \"S\", \"EAST\": \"E\", \"WEST\": \"W\", \"NORTHEAST\": \"NE\", \"NORTHWEST\": \"NW\",\n       \"SOUTHEAST\": \"SE\", \"SOUTHWEST\": \"SW\", \"MOUNT\": \"MT\", \"SAINT\": \"ST\", \"CROSSING\": \"XING\",\n       \"POINT\": \"PT\", \"HEIGHTS\": \"HTS\", \"ALLEY\": \"ALY\", \"LOOP\": \"LOOP\", \"WAY\": \"WAY\"}\n\n\ndef norm(s):\n    return \" \".join(re.sub(r\"[^A-Z0-9 ]\", \" \", (s or \"\").upper()).split())\n\n\ndef norm_street(s):\n    return \" \".join(ABR.get(t, t) for t in norm(s).split())\n\n\ndef opl_unesc(s):\n    return re.sub(r\"%([0-9a-fA-F]+)%\", lambda m: chr(int(m[1], 16)), s)\n\n\ndef opl_parse(line):\n    \"\"\"OPL -> (type, id, tags, x, y, refs, membres).\"\"\"\n    champs = line.rstrip(\"\\n\").split(\" \")\n    t, oid = champs[0][0], int(champs[0][1:])\n    tags, x, y, refs, mem = {}, None, None, [], []\n    for c in champs[1:]:\n        if not c:\n            continue\n        k, v = c[0], c[1:]\n        if k == \"T\" and v:\n            for kv in v.split(\",\"):\n                a, _, b = kv.partition(\"=\")\n                tags[opl_unesc(a)] = opl_unesc(b)\n        elif k == \"x\" and v:\n            x = float(v)\n        elif k == \"y\" and v:\n            y = float(v)\n        elif k == \"N\" and v:\n            refs = [int(r[1:]) for r in v.split(\",\")]\n        elif k == \"M\" and v:\n            mem = [(m[0], int(m[1:].split(\"@\")[0])) for m in v.split(\",\")]\n    return t, oid, tags, x, y, refs, mem\n\n\ndef osm_returned(tags):\n    return {\"number\": norm(tags.get(\"addr:housenumber\", \"\")), \"street\": norm_street(tags.get(\"addr:street\", \"\")),\n            \"city\": norm(tags.get(\"addr:city\", \"\")), \"state\": norm(tags.get(\"addr:state\", \"\")),\n            \"zip\": tags.get(\"addr:postcode\", \"\")[:5]}\n\n\ndef osm_addr_lines(pbf):\n    \"\"\"Lecteur FICHIER : tous les objets portant addr:housenumber (OPL, references omises).\"\"\"\n    return _flux([\"osmium\", \"tags-filter\", \"-R\", \"-f\", \"opl,add_metadata=false\", \"-o\", \"-\", pbf,\n                  \"nwr/addr:housenumber\"])\n\n\ndef _flux(cmd):\n    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1 << 20)\n    for line in p.stdout:\n        yield line\n    if p.wait() != 0:\n        raise RuntimeError(\"OSM_READER_FAILED : %s rc %s\" % (cmd[1], p.returncode))\n",
+   "name": "osm_normalization.py",
+   "role": "street and house-number normalization rules, OPL reading",
+   "sha256": "a2e40bead7f370f2a0a69f06ac6e348ebbb994d4f5bb686f9b7477a2558f01ae"
+  }
+ ],
+ "licence": {
+  "name": "Open Database License 1.0",
+  "note": "The derivative database is OpenStreetMap data only and is available under the ODbL.",
+  "url": "https://opendatacommons.org/licenses/odbl/1-0/"
+ },
+ "method_version": "osm-index-method v1 (2026-10-12)",
+ "normalization": {
+  "fingerprint": "sha256:8676974ace5ea744ea551e9c34d17ea370f278afb94f3fb707190ee059479a5d",
+  "fingerprint_method": "sha256 of the verbatim source of ABR, norm and norm_street (json, sorted keys)",
+  "module": "osm_normalization.py",
+  "rules": [
+   "ABR",
+   "norm",
+   "norm_street",
+   "opl_unesc",
+   "opl_parse",
+   "osm_returned",
+   "osm_addr_lines",
+   "_flux"
+  ]
+ },
+ "not_included": [
+  "address matching logic (how a request is compared to the index rows)",
+  "position selection, analyses and any other HouseRead code",
+  "any non-OpenStreetMap data (the index contains none)"
+ ],
+ "object": "ODBL_4_6_B_METHOD",
+ "source_extract": {
+  "bytes": 13557326289,
+  "file": "us50_dc_2026.osm.pbf",
+  "made_from": {
+   "bytes": 94983340321,
+   "file": "planet-260921.osm.pbf",
+   "md5_published": "2e6db09362084e200fc5b5807fe2613d",
+   "official_source": "https://planet.openstreetmap.org/pbf/planet-260921.osm.pbf",
+   "sha256": "bbfc6b4cadaf86e854fcae040e1db709f837f2f1e91c527139391edf661e60ed",
+   "url": "https://osm-planet-us-west-2.s3.amazonaws.com/planet/pbf/2026/planet-260921.osm.pbf"
+  },
+  "most_recent_object": "2026-09-21T00:00:03Z",
+  "planet_date": "2026-09-21",
+  "region": "the 50 U.S. states and the District of Columbia",
+  "sha256": "4be22b3612b16e7a903020709760db6581ef27175cbe2c4e99e38f6b0724d8df"
+ },
+ "title": "OpenStreetMap-derived address index: method (ODbL 4.6(b))"
+}
