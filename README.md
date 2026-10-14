@@ -22,3 +22,5 @@ on the extract named in `source_extract`. Equivalent OpenStreetMap data: <https:
 
 Data © OpenStreetMap contributors, available under the Open Database License:
 <https://www.openstreetmap.org/copyright>.
+
+Code: MIT. Data derived from OpenStreetMap: ODbL.
